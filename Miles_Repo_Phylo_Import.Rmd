@@ -1,0 +1,473 @@
+---
+title: "Miles_Repo_Phylo_Import"
+output: html_document
+---
+
+---
+title: "Tutorial 4: Comparing abundance and diversity between IR and IS"
+author: "Written by: Keisha Harrison"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: yes
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, error = TRUE)
+
+# Start from a clean environment so this tutorial always picks up the object
+# saved by Tutorial 2 rather than leftovers from another session.
+rm(list = ls())
+```
+
+# Background
+
+Tutorials 1 to 3 got the data into shape. This tutorial is where we start comparing two groups of people: those classified **insulin-resistant (IR)** and those classified **insulin-sensitive (IS)**.
+
+We are doing that because of a published result. The **MILES study** (Cui et al., *Diabetes* 2022) reported that butyrate-producing gut bacteria track with insulin homeostasis. Our exercise asks whether the same thing shows up in an independent, openly available cohort:
+
+> Are the gut microbial signatures identified in the MILES study **replicable** in the 16S relative abundance profiles of the iHMP2 dataset?
+
+## Reproducibility and replicability are not the same thing
+
+The two words get used interchangeably, and the point of this activity is lost if they stay blurred. These definitions follow the National Academies report *Reproducibility and Replicability in Science* (NASEM, 2019).
+
+| | **Reproducibility** | **Replicability** |
+|---|---|---|
+| What is held fixed | The **same data**, the same code | The **same question**, a new dataset |
+| What it tests | Whether the reported result follows from the analysis that was run | Whether the finding holds outside the original study |
+| A failure means | Something is wrong in the pipeline or the reporting | The original finding may be specific to that cohort, or to chance |
+
+**This activity is a replication attempt, not a reproduction.** We never had the MILES data. If our result disagrees with MILES, that is evidence about how far the MILES finding travels, not evidence that anyone made a mistake.
+
+It is worth being clear that we are not repeating the MILES experiment:
+
+| Element | MILES as published | What we have |
+|---|---|---|
+| Cohort | 352 adults | 44 participants at Visit 01: 28 IR, 16 IS |
+| Sequencing | Shotgun metagenomics, species level | 16S rRNA relative abundance, genus level |
+| Phenotype | Continuous oGTT insulin indices | A binary IR / IS label |
+
+So a positive result here means *the same genus leans the same way*, not *the MILES effect size reproduced*.
+
+## Three ways to compare two groups
+
+Describing a community means answering three different questions, and this tutorial takes them in order.
+
+| Comparison | Question it answers | What it looks at | What you get back |
+|---|---|---|---|
+| **Abundance** | *What is in there?* | The mean share of each genus in each group | Which genera dominate, and whether the groups differ in what dominates them |
+| **Evenness** | *How is it shared out?* | How equally the reads are spread across genera **within** each sample | Alpha diversity: one number per sample, compared between groups |
+| **Across samples** | *Do the groups separate?* | How different each pair of samples is **from each other** | Beta diversity: a 2D map of all 44 samples |
+
+Pay attention to the third column. **Abundance** and **evenness** describe samples one at a time. **Across samples** compares every sample to every other one, which is a different question and can give a different answer. A group can have the same average composition and still be much more variable, or vice versa.
+
+# Tutorial overview
+
+In Tutorial 4 we will:
+
+- Load the `phyloseq` object saved in Tutorial 2, and **confirm it holds what the MILES replication needs**
+- **Subset** it down to an analysis set: one visit, the two groups of interest, one taxonomic rank
+- Compare **genus abundance** between IR and IS, and find which genera dominate each group
+- Compare **genus evenness** between IR and IS, using alpha diversity
+- **Visualize diversity across samples** with an ordination, to see whether the groups separate
+- Save the subset so Tutorial 5 can answer the replication question with it
+
+**Prerequisites:** completed Tutorial 2, so that `tutorial2_objects.RData` exists. Tutorial 3 is worth doing first for context, since its findings about visit coverage and IR/IS labelling are what justify the subsetting choices in Step 2. Plus the packages listed below.
+
+---
+
+# Step 1: Set up the working environment
+
+## 1.1 Load required libraries
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("phyloseq")
+
+```
+
+
+```{r load_lib}
+library(phyloseq)  # the microbiome data container and its tools
+library(vegan)     # community ecology: diversity indices and distances
+library(dplyr)     # data manipulation: grouping, summarizing
+library(tidyr)     # reshaping: pivot_longer
+library(ggplot2)   # plotting
+library(here)      # file access
+```
+
+**Where each function in this tutorial comes from:**
+
+| Package | Functions used in Tutorial 4 |
+|---|---|
+| `phyloseq` | `subset_samples()`, `subset_taxa()`, `taxa_sums()`, `prune_taxa()`, `sample_sums()`, `sample_data()`, `sample_names()`, `sample_variables()`, `nsamples()`, `ntaxa()`, `otu_table()`, `taxa_are_rows()`, `transform_sample_counts()`, `psmelt()`, `ordinate()`, `plot_ordination()` |
+| `vegan` | `diversity()` |
+| `dplyr` | `group_by()`, `summarise()`, `slice_max()`, `mutate()`, `select()` |
+| `tidyr` | `pivot_longer()` |
+| `ggplot2` | `ggplot()`, `aes()`, `geom_col()`, `geom_boxplot()`, `geom_jitter()`, `geom_point()`, `facet_wrap()`, `labs()`, `theme_minimal()`, `theme()`, `element_text()`, `unit()` |
+| **base R** (nothing to load) | `load()`, `save()`, `table()`, `sum()`, `summary()`, `rowSums()`, `colMeans()`, `match()`, `factor()`, `round()`, `wilcox.test()` |
+
+> **A note on `subset_samples()` and `subset_taxa()`.** These are phyloseq's versions of `dplyr::filter()`. `subset_samples()` filters on the **sample metadata**; `subset_taxa()` filters on the **taxonomy table**. Either way phyloseq also drops the matching part of the abundance table, so the object never goes out of sync. That is the whole reason we kept the data in a phyloseq object rather than three loose tables.
+
+## 1.2 Load the phyloseq object from Tutorial 2
+
+We want `ps`: the phyloseq object holding all 855 samples at all five taxonomic ranks. **Tutorial 2** built it and saved it to `tutorial2_objects.RData`.
+
+Tutorial 3 is not being skipped, it simply does not produce the object we need here. Tutorial 3 agglomerated, normalized and melted `ps` to demonstrate that workflow on the whole dataset, and explored the metadata — which is where we learned that Visit 01 is the fullest cross-section and that 192 samples carry no IR/IS label. Both of those findings drive Step 2 below. But the subset we are about to build has to start from the *untouched* object, so we pick `ps` back up from Tutorial 2.
+
+```{r load_data}
+# Tutorial 2 saved `ps` here. These tutorials sit in a subfolder alongside the
+# earlier ones, so look in the working directory first, then one level up.
+
+ps_file <- here("day5", "day5_01_reproducible_research", "tutorial2_objects.RData")
+
+
+ps                     # print the object's summary to confirm it loaded
+sample_variables(ps)   # tell us which metadata columns are available to group by?
+```
+
+> If this errors with *"cannot open file"*, the file is not where the tutorial is looking. Run `getwd()` to see where R currently is, then in RStudio use **Session -> Set Working Directory -> To Source File Location**. You need `tutorial2_objects.RData` either in that folder or in its parent. If you have never run Tutorial 2, run it now: nothing below will work without it.
+
+## 1.3 Confirm this is the data the MILES replication needs
+
+Loading an object is not the same as checking it is the right one. Before we touch `ps`, hold it up against the four things the replication actually requires. Those four are not arbitrary: they are what you get by working backwards from the question "do the MILES genera behave the same way here?"
+
+| # | What the replication needs | Why |
+|---|---|---|
+| 1 | A gut microbiome measurement | Without it there is nothing to compare |
+| 2 | An insulin phenotype, on the **same** participants | Two tables from different people cannot be joined into a comparison |
+| 3 | The **specific genera MILES named** | A dataset that never measured them cannot test them |
+| 4 | Enough participants at a single time point | Repeated visits are not independent observations |
+
+**Check 1: is there a gut microbiome measurement, and at what resolution?**
+
+```{r check_microbiome}
+nsamples(ps)   # how many samples?
+ntaxa(ps)      # how many features?
+
+# What taxonomic ranks are in the table, and how many features at each?
+taxonomy <- as.data.frame(as(tax_table(ps), "matrix"))
+table(taxonomy$Rank)
+
+# Are these read counts, or proportions? Counts are whole numbers >= 0.
+range(otu_table(ps))
+```
+
+855 samples and 96 features, spread across five ranks with **45 genera** among them. The values run from 0 to just under 1 rather than being whole numbers, so this is **relative abundance, not raw counts**. That single fact shapes the whole analysis: it is why two diversity estimators are unavailable in Step 4, and why Tutorial 5 has to transform the data before testing any genus.
+
+**Check 2: is there an insulin phenotype, recorded on the same participants?**
+
+```{r check_phenotype}
+sample_variables(ps)   # every metadata column attached to these samples
+
+# The grouping variable the whole comparison rests on
+table(sample_data(ps)$ir_is_classification, useNA = "ifany")
+```
+
+`ir_is_classification` is there, and because it sits in the *sample* data of the same phyloseq object, it is guaranteed to line up with the abundance table sample by sample. That alignment is the thing Tutorial 2's join bought us, and it is what makes a two-group comparison possible at all.
+
+Note the third category: **192 samples are `Unknown`**. Those participants were never classified, so they can play no part in an IR-versus-IS comparison. Step 2.2 removes them.
+
+**Check 3: does this taxonomy actually contain the genera MILES named?**
+
+This is the check that matters most, and the one most easily skipped. A dataset can have microbiome data and a phenotype and still be unable to test the claim, simply because it never resolved the organisms in question.
+
+```{r check_miles_genera}
+# The genera MILES reported, written down before we look at anything
+miles_genera <- c("Alistipes", "Coprococcus", "Flavonifractor", "Odoribacter",
+                  "Oscillibacter", "Pseudoflavonifractor", "Anaerostipes")
+
+# Every genus name this dataset knows about
+hmp2_genera <- taxonomy$Taxon[taxonomy$Rank == "Genus"]
+
+data.frame(Genus = miles_genera, present_in_HMP2 = miles_genera %in% hmp2_genera)
+```
+
+Six of the seven are here. **`Anaerostipes` is not**, and finding that out now rather than halfway through Tutorial 5 is the point of running this check.
+
+> **Worth pausing on.** A genus you cannot test is not a genus that failed the test. Either *Anaerostipes* is genuinely absent from these participants, or the HMP2 classifier never assigned reads to it — different reference databases and different 16S regions resolve genera differently, and MILES used shotgun metagenomics rather than a 16S amplicon at all. The data cannot tell us which. Report it as "not detected", and be honest that we could only check six sevenths of the MILES claim.
+
+**Check 4: is there enough data at a single time point?**
+
+```{r check_visits}
+# Samples per visit, biggest first
+head(sort(table(sample_data(ps)$VisitID), decreasing = TRUE), 4)
+```
+
+Visit 01 is the fullest cross-section at 69 samples, which is what Tutorial 3's exploration found and why Step 2.1 picks it.
+
+**The verdict on the data:**
+
+| Requirement | Met? | Detail |
+|---|---|---|
+| Gut microbiome measurement | Yes | 855 samples, 45 genera, as relative abundance |
+| Insulin phenotype on the same participants | Yes | `ir_is_classification`, though 192 samples are unlabelled |
+| The genera MILES named | **Partly** | 6 of 7 present; *Anaerostipes* absent from the taxonomy |
+| Enough at one time point | Yes | Visit 01 has 69 samples, the most of any visit |
+
+Good enough to proceed, with two limitations written down before we start rather than discovered later: one of the seven target genera cannot be tested at all, and the measurements are proportions rather than counts.
+
+
+---
+
+# Step 2: Build the analysis subset
+
+The object we just loaded holds every sample from every visit at all five taxonomic ranks. It is not usable as delivered for an IR-versus-IS comparison. Four things are in the way, and we fix them one at a time.
+
+## 2.1 Keep one visit
+
+HMP2 is *longitudinal*: each participant came back several times, and not all of them the same number of times. Two samples from the same person are not independent observations, so treating them as if they were would overstate how much data we have. The simplest fix is a single cross-section. Tutorial 3 showed Visit 01 has the most consistent participation, and a single time point is also what MILES used.
+
+```{r subset_v01}
+visit01 <- subset_samples(ps, VisitID == "01")
+nsamples(visit01)   # 855 samples down to 69
+```
+
+## 2.2 Keep the two groups we are comparing
+
+The metadata column `ir_is_classification` holds `"IR"`, `"IS"`, and `"Unknown"` for participants who were never classified. Tutorial 3 counted those: 192 samples across the whole dataset carry no label. A sample with no group label has nothing to contribute to a two-group comparison, so it comes out.
+
+The `%in%` operator below tests whether each value matches *any* of the strings on the right.
+
+```{r subset_iris}
+visit01_IRIS <- subset_samples(visit01, ir_is_classification %in% c("IR", "IS"))
+
+nsamples(visit01_IRIS)                                 # 69 down to 44
+table(sample_data(visit01_IRIS)$ir_is_classification)  # expect IR 28, IS 16
+```
+
+> **Worth pausing on: 28 IR against 16 IS.** That imbalance is what the cohort looks like at Visit 01, not a mistake, but it costs statistical power. Small, uneven groups are the single biggest limitation on everything that follows. Carry the numbers 28 and 16 with you through every p-value in this tutorial and the next.
+
+## 2.3 Keep one taxonomic rank
+
+Tutorial 2 noted that the HMP2 table reports proportions at **five ranks at once** (phylum, class, order, family, genus), each feature tagged in the taxonomy table's `Rank` column, so a full row sums to roughly 5 rather than 1. Any calculation over all of them counts the same reads five times over. We keep genus, the finest rank 16S gives us.
+
+```{r restrict_genus}
+visit01_IRIS <- subset_taxa(visit01_IRIS, Rank == "Genus")
+
+ntaxa(visit01_IRIS)   # 96 features down to 45 genera
+```
+
+## 2.4 Drop genera that were never seen
+
+`taxa_sums()` gives each taxon's total across all samples in the object. A genus totalling zero was not observed anywhere in our 44 samples, so it tells us nothing about them and only slows later calculations down.
+
+```{r prune_zero}
+sum(taxa_sums(visit01_IRIS) == 0)   # how many all-zero genera?
+
+visit01_IRIS <- prune_taxa(taxa_sums(visit01_IRIS) > 0, visit01_IRIS)
+ntaxa(visit01_IRIS)
+```
+
+## 2.5 What the subset is, and what it is not
+
+```{r subset_summary}
+visit01_IRIS
+summary(sample_sums(visit01_IRIS))   # note: these do NOT sum to 1
+```
+
+We have 44 stool samples, 28 IR and 16 IS, described by genus-level relative abundances.
+
+Notice the sample sums fall short of 1. Reads that HMP2 could classify to family or order but not all the way to genus were reported at those coarser ranks, and we just dropped those ranks. Each sample is therefore on a slightly different scale, which we correct by renormalizing in the next step.
+
+> **What preprocessing can and cannot do.** Compare this subset against the MILES table in the Background: shotgun metagenomics on 352 people with continuous oGTT indices, against 16S on 44 people with a binary label. The steps above made the data *appropriate for an analysis*. They could not make it into the MILES data, and no amount of processing could.
+
+---
+
+# Step 3: Compare genus abundance between IR and IS
+
+First question from the Background table: **what is in there, and do the two groups differ in what dominates them?**
+
+## 3.1 Normalize, then melt
+
+This is the same **normalize** and **melt** pair from Tutorial 3. `transform_sample_counts()` rescales each sample so its 45 genera sum to exactly 1, and `psmelt()` takes the data out of the phyloseq container into one long data frame with one row per sample-and-genus pair, with the metadata and taxonomy joined on.
+
+```{r normalize_melt}
+# Divide each sample by its own total, so every sample sums to 1
+visit01_rel <- transform_sample_counts(visit01_IRIS, function(x) x / sum(x))
+
+# Check it worked: every sample total should now be 1
+all(abs(sample_sums(visit01_rel) - 1) < 1e-9)
+
+# One row per sample x genus, with metadata and the clean Taxon label attached
+df <- psmelt(visit01_rel)
+dim(df)   # 44 samples x 45 genera = 1980 rows
+```
+
+## 3.2 Which genera dominate each group?
+
+```{r genus_means, fig.width = 7, fig.height = 5}
+# Mean relative abundance of each genus within each group
+genus_means <- df |>
+  group_by(ir_is_classification, Taxon) |>
+  summarise(mean_abund = mean(Abundance), .groups = "drop")
+
+ggplot(genus_means, aes(x = ir_is_classification, y = mean_abund, fill = Taxon)) +
+  geom_col() +                                  # stacked bar, one column per group
+  labs(
+    title = "Mean genus-level composition by IR / IS group",
+    x     = "IR / IS classification",
+    y     = "Mean relative abundance"
+  ) +
+  theme_minimal() +
+  theme(legend.key.size = unit(0.3, "cm"),      # 45 genera need a small legend
+        legend.text     = element_text(size = 6))
+```
+
+A 45-colour stacked bar is hard to read precisely, so print the leaders as numbers too:
+
+```{r top_genera}
+genus_means |>
+  group_by(ir_is_classification) |>
+  slice_max(mean_abund, n = 5) |>               # the 5 biggest genera per group
+  mutate(percent = round(100 * mean_abund, 1)) |>
+  select(ir_is_classification, Taxon, percent)
+```
+
+**What this says.** *Bacteroides* is the single most abundant genus in both groups, at about 40% of the mean IR community and 32% of the mean IS community, with *Faecalibacterium* and the Lachnospiraceae close behind in both. The two groups share their dominant genera, and the overall shape of the composition is more similar than different.
+---
+
+# Step 4: Compare genus evenness between IR and IS
+
+Second question from the Background table: **how is the abundance shared out within a single sample?** That is **alpha diversity**, and it bundles two distinct ideas:
+
+- **Richness** — how many different genera are present at all. `Observed` counts them.
+- **Evenness** — how equally the community is divided among them. A sample where one genus takes 90% is less even than one where ten genera take 10% each.
+
+`Shannon` and `Simpson` each combine richness and evenness into one number, with Simpson weighted more toward the dominant genera. Higher means more diverse and more evenly shared.
+
+## 4.1 Compute the indices
+
+```{r alpha}
+# vegan wants a samples x genera matrix; phyloseq may store it either way round,
+# so check with taxa_are_rows() and transpose if needed.
+mat <- as(otu_table(visit01_rel), "matrix")
+if (taxa_are_rows(visit01_rel)) mat <- t(mat)
+
+alpha <- data.frame(
+  SampleID = rownames(mat),
+  Observed = rowSums(mat > 0),                        # richness: genera present
+  Shannon  = vegan::diversity(mat, index = "shannon"),
+  Simpson  = vegan::diversity(mat, index = "simpson"),
+  Group    = factor(sample_data(visit01_rel)$ir_is_classification[
+                      match(rownames(mat), sample_names(visit01_rel))],
+                    levels = c("IR", "IS"))
+)
+
+head(alpha)
+```
+
+> **A note on Chao1 and ACE.** `phyloseq::estimate_richness()` also computes diversity indices, and you will see it in most tutorials. Two of its estimators, Chao1 and ACE, need integer read **counts**, and it refuses to run on relative abundances. HMP2 only ever gave us proportions (Tutorial 1), so those two indices are unavailable to us. Shannon, Simpson and observed richness are defined on proportions, which is why we can use them here.
+
+## 4.2 Look before you test
+
+```{r alpha_plot, fig.width = 8, fig.height = 3.5}
+alpha_long <- pivot_longer(alpha, c(Observed, Shannon, Simpson),
+                           names_to = "Index", values_to = "Value")
+
+ggplot(alpha_long, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +   # box = spread of the group
+  geom_jitter(width = 0.15, size = 1.6, alpha = 0.7) +  # every sample as a point
+  facet_wrap(~ Index, scales = "free_y") +          # one panel per index
+  labs(
+    title    = "Alpha diversity by insulin classification",
+    subtitle = "Visit 01, n = 28 IR and 16 IS",
+    x        = "Insulin sensitivity classification",
+    y        = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## 4.3 Summarize and test
+
+The **Wilcoxon rank-sum test** compares two groups using only the ranks of the values, so it makes no assumption that the data follow a bell curve. Microbiome measurements rarely do, which is why it is the standard choice here.
+
+```{r alpha_test}
+alpha |>
+  group_by(Group) |>
+  summarise(n = n(),
+            across(c(Observed, Shannon, Simpson),
+                   list(mean = ~round(mean(.x), 2), sd = ~round(sd(.x), 2))))
+
+# One test per index, comparing IR against IS
+for (m in c("Observed", "Shannon", "Simpson")) {
+  p <- suppressWarnings(wilcox.test(alpha[[m]] ~ alpha$Group)$p.value)
+  cat(sprintf("%-9s  p = %.3f\n", m, p))
+}
+```
+
+**Reading the result.** All three indices are higher in the insulin-sensitive samples, which is the direction the literature predicts: mean Shannon is 2.00 in IR against 2.19 in IS. But direction is not evidence. Shannon gives p = 0.23 and Simpson p = 0.33, neither close to significant at 28 versus 16 samples. Observed richness lands at p = 0.047, just under the conventional threshold — one test among three, on a dataset we are about to test 45 more times, so treat it as a lead rather than a finding.
+
+The honest summary: **the two groups' communities are similarly diverse, with a consistent but weak lean toward the insulin-sensitive samples.**
+
+---
+
+# Step 5: Visualize diversity across samples
+
+Third question from the Background table: **do the two groups separate?** Steps 3 and 4 looked at samples one at a time. This step compares every sample to every other one, which is **beta diversity**.
+
+Two pieces do the work:
+
+- **Bray-Curtis dissimilarity** scores how different any two samples are, from 0 (identical profiles) to 1 (no genera in common).
+- **PCoA** takes that whole grid of pairwise dissimilarities and finds a 2D map on which the distance between two points approximates their real dissimilarity as closely as it can. Samples with similar communities land near each other.
+
+```{r ordination, fig.width = 6.5, fig.height = 4.5}
+visit01_ord <- ordinate(visit01_rel, method = "PCoA", distance = "bray")
+
+plot_ordination(visit01_rel, visit01_ord,
+                color = "ir_is_classification",   # color each point by group
+                shape = "ir_is_classification") + # and give each its own shape
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title    = "PCoA of gut community structure at Visit 01",
+    subtitle = "Bray-Curtis dissimilarity, colored by insulin sensitivity",
+    color    = "IR / IS",
+    shape    = "IR / IS"
+  ) +
+  theme_minimal()
+```
+
+```{r ord_variance}
+# How much of the real structure the two plotted axes actually capture, as a %
+round(100 * visit01_ord$values$Relative_eig[1:2], 1)
+```
+
+**What the picture shows.** IR and IS samples are heavily intermingled. There is no clean separation into two clouds, so whatever difference exists between the groups is small compared with how much individuals differ from one another. That is completely typical of microbiome studies. The two plotted axes carry about 38% and 12% of the structure, so roughly half of it is not on this plot at all.
+
+> **Resist reading significance off an ordination.** The eye is good at finding patterns in noise, and two axes cannot show everything. A formal test of whether the groups occupy different regions of this space does exist (PERMANOVA, `vegan::adonis2()`) and is worth learning, but it is beyond this exercise. Our replication question is about specific named genera, and Tutorial 5 tests those directly.
+
+---
+
+# Step 6: Save the subset for Tutorial 5
+
+Tutorial 5 begins by `load()`-ing these objects, so we save them here. Reloading rather than rebuilding means the two tutorials are guaranteed to be describing the same 44 samples.
+
+```{r save}
+# The subset itself, plus the normalized version Tutorial 5 works from
+save(visit01, visit01_IRIS, visit01_rel, file = "visit01_ps.RData")
+
+# The summaries this tutorial produced, so Tutorial 5 can quote them
+save(alpha, genus_means, visit01_ord, file = "tutorial4_objects.RData")
+```
+
+---
+
+**Where this leaves you:** you have described the two groups three ways, and found them broadly similar.
+
+| Question | Method | Result |
+|---|---|---|
+| What is in there? | Mean relative abundance per genus | *Bacteroides* leads both, ~40% IR and ~32% IS; same dominant genera |
+| How is it shared out? | Shannon, Simpson, observed richness + Wilcoxon | All lean higher in IS, none convincingly: p = 0.23, 0.33, 0.047 |
+| Do the groups separate? | Bray-Curtis PCoA | No clear separation; IR and IS intermingle |
+
+**None of this has answered the replication question yet.** The MILES genera sit below 1% mean abundance, where a share-of-the-whole scale is misleading to compare on.
+
+**Next:** continue to **Tutorial 5: CLR-transformed abundance and the replication verdict**, where you will fix that scale problem and test the MILES genera one at a time.
